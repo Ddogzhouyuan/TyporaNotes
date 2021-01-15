@@ -1,5 +1,7 @@
 # HDFS
 
+全称HADOOP DISTRIBUTED FILE SYSTEM，简称**HDFS**，是一个分布式文件系统。
+
 ## HDFS的设计目标
 
 HDFS是以流式数据访问模式来存储超大文件，运行于商用硬件集群上。
