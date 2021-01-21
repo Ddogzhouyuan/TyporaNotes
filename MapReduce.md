@@ -77,19 +77,103 @@ JobSubmitter实现作业提交过程：
 
 ### 进度状态更新
 
+一个作业和它的每个任务都有相应的状态信息，包括：作业或任务的状态（成功、失败、运行中）、map和reduce的进度、作业计数器的值、状态消息或描述等。
 
+任务中有一组计数器，负责对任务运行过程中的事件进行计数。
+
+当map任务或reduce任务运行时，子进程和自己的父Application Master通过接口通信。每隔一定时间，任务通过接口向Application Master报告进度和状态（通过计数器）。
+
+在作业运行期间，客户端每秒（可通过mapreduce.client.progressmonitor.pollinterval设置）轮询一次Application Master，通过使用Job的getStatus()方法接受作业最新状态（返回JobStatus的实例，包含所有状态信息）
+
+![](assets\MapReduce状态更新.png)
 
 ### 作业完成
 
+当Application Master收到作业最后一个任务已完成的通知后，会吧作业的状态置为successfully。作业打印信息告知用户，客户端中waitForCompletion()方法返回。作业的统计信息和计数器信息输出到控制台。
+
+作业完成，Application Master所在容器和任务所在容器清理工作状态（删除中间结果），作业信息由历史服务器存档，以便日后用户查询。
+
 ## 作业失败
 
-### 任务失败
+在现实情况中，导致作业失败的原因可能有用户代码错误、进程崩溃、机器故障等等。
+
+### 任务运行失败
+
+最常见的情况是map或reduce任务中代码运行时抛出异常，此时JVM会在退出之前向其对应的Application Master发送错误报告，报告会被写进日志。Application Master将任务标记为failed，释放容器资源。
+
+另一种情况是JVM突然退出，节点管理器会检测到进程已经退出，通知Application Master将任务标记为failed。
+
+还有一种超时失败，当Application Master有一段时间没有收到进度更新，便会将任务标记为失败，任务的JVM进程会被kill掉，超时间隔可以通过mapreduce.task.timeout参数设置。
+
+Application Master被告知一个任务尝试失败后，会试图避免在以前失败过的接点上重新调度该任务。（黑名单机制）
 
 ### Application Master运行失败
 
+当作业运行失败时，Application Master可以重新尝试提交作业，但是有最大次数的限制。
+
+Application Master会向资源管理器发送周期性的心跳，当Application Master失败时，资源管理器检测到失败后会在一个新的容器里新建Application Master实例。
+
 ### 节点管理器运行失败
+
+与Application Master类似，节点管理器会向资源管理器发送心跳信息。如果10分钟（通过yarn.resourcemanager.nm.liveness-monitor.expiry-interval-ms设置）没有收到任何心跳信息，资源管理器就会将节点管理器从节点池中移除。
+
+同样，如果失败次数过多，节点管理器可能会被拉黑。
 
 ### 资源管理器运行失败
 
+资源管理器运行失败是很严重的问题，如果没有备用资源管理器，作业和任务容器将无法启动，所以为了获得高可用性，需要同时运行一对资源管理器。如果主资源管理器故障，客户端和节点管理器会反复尝试连接备用资源管理器，直到备用资源管理器变为主资源管理器。
 
 
+
+## Shuffle
+
+MapReduce确保每个reducer的输入都是按照键进行排序的，系统执行排序、将map输出作为输入传给reducer的过程称为shuffle。shuffle是MapReduce的"心脏"，是奇迹发生的地方。
+
+### map端shuffle
+
+* 每个分片数据都由一个map任务处理，处理的输出结果不会直接写到磁盘上，因为每个map任务都有一个环形内存缓冲区用于存储任务输出。缓冲区的大小有100M（通过mapreduce.task.io.sort.mb设置），当缓冲区的数据超过80%（通过mapreduce.map.sort.spill.percent设置），缓冲区的溢出结果会被写到磁盘上，生成新的溢出文件（spill file），该文件没有固定大小。
+* 在写磁盘之前，会根据后续的reducer把数据划分成相应的分区（partition），在每个分区中，按照键进行内存中排序（sort by key），如果设置了combiner，会对排序后结果进行combine操作，相当于本地的reduce，目的是减少写入磁盘的数据和传递给reducer的数据。
+* 随着map任务不断执行，不断生成溢出文件，通过对这些溢出文件进行合并、排序，最后合并成一个已分区且已排序的输出文件。
+* 还可以对map的输出结果进行压缩，这样写磁盘的速度更快，节约磁盘空间，同时也能减少传给reducer的数据量。（通过mapreduce.map.output.compress和mapreduce.map.output.compress.codec设置）
+* reducer通过HTTP得到输出文件的分区。
+
+#### 分片
+
+一个输入分片（split）就是一个由单个map任务来处理的输入块，每一个map任务只处理一个输入分片。
+
+分片（split）与数据块（block）：
+
+分片通常和HDFS数据块大小一样。
+
+![](assets\分片与块.png)
+
+#### map任务的数量：
+
+对于大文件：由分片数量决定的，一个 分片对应一个map任务。先明确一点分片的大小可自己配置，一般来说对于大文件会选择分片大小等于数据块大小，如果分片大小小于数据块大小的话，会增加 map 的数量，虽然这样可以增加map执行的并行度，但是会导致map任务在不同节点拉取数据，浪费了网络资源等。
+
+对于小文件：由参与任务的文件数量决定，默认情况一个小文件启动一个 map 任务，小文件数量较多会导致启动较大数量的 map 任务，增加资源消耗。可以将多个小文件通过 InputFormat 合并成一个大文件加入到一个 split 中，并增加 split 的大小，这样可以有效减少 map 的数量，降低并发度，减少资源消耗。
+
+### reduce端shuffle
+
+* reduce任务的复制阶段：由于每个map任务的完成时间可能不同，因此在每个任务完成时，reduce任务就开始复制它的输出，reduce通过mapreduce.shuffle.parallelcopies设置，并行取得map的输出。
+* 如果 reduce 接收到的数据较小，则会存在内存缓冲区中，直到数据量达到该缓存区的一定比例时对数据进行合并后溢写到磁盘上。随着溢写的文件越来越多，后台的线程会将他们合并成一个更大的有序的文件，可以为后面合并节省时间。
+* 这其实跟 map端的操作一样，都是反复的进行排序、合并，这也是 Hadoop 的灵魂所在，但是如果在 map 已经压缩过，在合并排序之前要先进行解压缩。
+* 合并的过程会产生很多中间文件，但是最后一个合并的结果是不需要写到磁盘上，而是可以直接输入到 reduce 函数中计算，对已排序的输出结果中的每个键调用reduce函数。
+
+![](assets/shuffle过程.png)
+
+## 推测执行
+
+MapReduce将作业分解成任务，并行地运行任务以使得作业整体执行时间少于各个任务顺序执行时间，但是一个运行缓慢的任务会拉长整个作业的运行时间。
+
+所以Hadoop在一个任务运行比预期慢的时候，会启动令一个相同的任务作为备份，这就是推测执行。
+
+推测执行虽然是一种优化措施，但是对集群的资源也是一种浪费，该配置默认是开启的。
+
+
+
+## Quiz
+
+1. map和reduce函数的形式是怎样？
+2. MapReduce作业运行包含那些部分，过程是怎样的？
+3. map和reduce的shuffle过程
